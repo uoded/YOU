@@ -9,7 +9,7 @@ Le flux principal reste :
 ```text
 FortiManager
     ↓
-MySQL
+SQL
     ↓
 Redis
 ```
@@ -17,13 +17,13 @@ Redis
 Avec :
 
 ```text
-1. extraction quotidienne FortiManager → MySQL à 14:02
-2. promotion / mise en cache MySQL → Redis après l'extraction
-3. synchronisation périodique MySQL → Redis
+1. extraction quotidienne FortiManager → SQL à 14:05
+2. promotion / mise en cache SQL → Redis après l'extraction
+3. synchronisation périodique SQL → Redis
 4. nettoyage périodique des caches/données orphelins
 ```
 
-MySQL reste la source persistante de vérité.
+SQL reste la source persistante de vérité.
 
 Redis reste un cache reconstructible.
 
@@ -50,13 +50,13 @@ Déclenchement :
 
 ```text
 Celery Beat
-→ tous les jours à 14:02 Europe/Paris
+→ tous les jours à 14:05 Europe/Paris
 ```
 
 Responsabilité :
 
 ```text
-FortiManager → MySQL
+FortiManager → SQL
 ```
 
 Elle ne remplit pas Redis pendant l’extraction.
@@ -107,7 +107,7 @@ de traiter simultanément le même FortiManager
 Il ne verrouille absolument pas :
 
 ```text
-MySQL
+SQL
 Redis
 Celery
 un worker
@@ -350,7 +350,7 @@ Si cet appel réussit :
 ```text
 liste FMG
 ↕
-ADOMs connus en MySQL
+ADOMs connus en SQL
 ```
 
 On peut déterminer :
@@ -601,7 +601,7 @@ uniquement pour les erreurs transitoires :
 timeout
 connection reset
 service temporairement indisponible
-erreur temporaire MySQL/Redis/FMG
+erreur temporaire SQL/Redis/FMG
 ```
 
 Avec :
@@ -698,7 +698,7 @@ afin d’éviter les collisions de `policyid` entre packages ou VDOMs.
 
 ---
 
-# 28. Écriture MySQL uniquement après succès complet
+# 28. Écriture SQL uniquement après succès complet
 
 Après réussite complète de l’ADOM :
 
@@ -727,9 +727,9 @@ data_version = nouvelle version
 
 ---
 
-# 29. Transaction MySQL courte
+# 29. Transaction SQL courte
 
-Les appels réseau FMG sont effectués **hors transaction MySQL**.
+Les appels réseau FMG sont effectués **hors transaction SQL**.
 
 Seulement à la fin :
 
@@ -741,7 +741,7 @@ UPDATE ligne ADOM
 COMMIT
 ```
 
-Aucun verrouillage global de MySQL.
+Aucun verrouillage global de SQL.
 
 ---
 
@@ -778,14 +778,14 @@ refresh_rules_cache(sync_run_id)
 Responsabilité :
 
 ```text
-MySQL → Redis
+SQL → Redis
 ```
 
 Aucun appel à FortiManager.
 
 ---
 
-# 32. Pas de lock supplémentaire pour MySQL → Redis
+# 32. Pas de lock supplémentaire pour SQL → Redis
 
 On ne rajoute pas de lock applicatif pour :
 
@@ -809,7 +809,7 @@ Toujours :
 
 ```text
 aucun lock Redis global
-aucun lock MySQL global
+aucun lock SQL global
 aucun lock Celery global
 aucun lock worker global
 ```
@@ -843,7 +843,7 @@ daily-policy-sync:fmg:{uid}:adom:{name}:data:{version}
 Supposons :
 
 ```text
-MySQL data_version = V123
+SQL data_version = V123
 Redis current = V122
 ```
 
@@ -923,7 +923,7 @@ La valeur reste configurable.
 Responsabilité :
 
 ```text
-MySQL → vérification Redis
+SQL → vérification Redis
 ```
 
 Jamais :
@@ -962,14 +962,14 @@ Redis V123
 ```text
 DB V123
 Redis absent
-→ charger rules MySQL
+→ charger rules SQL
 → créer V123
 ```
 
 ```text
 DB V123
 Redis V122
-→ charger rules MySQL
+→ charger rules SQL
 → promouvoir V123
 ```
 
@@ -991,7 +991,7 @@ Redis vide
 ↓
 reconciler
 ↓
-lecture MySQL
+lecture SQL
 ↓
 reconstruction des caches
 ```
@@ -1033,7 +1033,7 @@ Le cleanup sait alors exactement quel namespace Redis cibler.
 
 # 44. Redis indisponible pendant cleanup
 
-On ne supprime pas immédiatement la ligne MySQL qui permet encore d’identifier le cache.
+On ne supprime pas immédiatement la ligne SQL qui permet encore d’identifier le cache.
 
 On retentera lors d’un passage ultérieur.
 
@@ -1224,7 +1224,7 @@ adom_id
 version
 ```
 
-Les données restent dans MySQL.
+Les données restent dans SQL.
 
 ---
 
@@ -1272,7 +1272,7 @@ deux extractions du même FMG
 tâche legacy simultanée
 préservation absolue des clés Redis legacy
 préservation des timeouts/retries legacy
-gros JSON MySQL/Redis
+gros JSON SQL/Redis
 ```
 
 ---
@@ -1284,7 +1284,7 @@ En synthèse :
 ```text
                        CELERY BEAT
                            │
-                         14:02
+                         14:05
                            │
                            ▼
                   extract_daily_rules
@@ -1305,7 +1305,7 @@ En synthèse :
                     │            │
                     ▼            ▼
                 nouveau       ancien
-                 MySQL         MySQL
+                 SQL         SQL
                     │          conservé
                     └─────┬──────┘
                           │
@@ -1319,7 +1319,7 @@ En synthèse :
                 refresh_rules_cache
                           │
                           ▼
-                     MySQL
+                     SQL
                           │
                           ▼
                  Redis data:Vnew
@@ -1340,7 +1340,7 @@ En parallèle :
 reconcile_rules_cache
         │
         ▼
-MySQL ↔ Redis
+SQL ↔ Redis
         │
         ├── cohérent → rien
         ├── absent → reconstruire
@@ -1368,7 +1368,7 @@ Le seul lock applicatif retenu protège
 l'exécution de la nouvelle extraction
 pour UN FortiManager précis.
 
-Il ne verrouille ni Redis, ni MySQL,
+Il ne verrouille ni Redis, ni SQL,
 ni Celery, ni un worker, ni tous les FMG,
 ni les tâches legacy.
 
