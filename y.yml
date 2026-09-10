@@ -1,0 +1,2444 @@
+Voici le **plan final consolidé**, mis à jour avec toutes les décisions prises depuis l’ancien plan des 35 étapes jusqu’à notre dernier échange. J’écarte explicitement ce que nous avons décidé de ne pas implémenter, et je conserve les mécanismes retenus pour éviter toute régression du legacy.
+
+## 1. Principe général de l’architecture
+
+La fonctionnalité repose sur cette chaîne :
+
+```text
+FortiManager
+    ↓
+Extraction quotidienne
+    ↓
+MySQL = source de vérité
+    ↓
+Construction du cache
+    ↓
+Redis = copie dérivée/reconstructible
+```
+
+Les règles importantes sont :
+
+```text
+- aucune ancienne tâche legacy ne doit être modifiée ;
+- aucun ancien cache Redis ne doit être modifié ou supprimé ;
+- aucun timeout legacy ne doit changer ;
+- aucun retry legacy ne doit changer ;
+- aucun lock legacy ne doit être utilisé ;
+- tous les nouveaux éléments doivent être namespacés spécifiquement ;
+- un ADOM n'est valide que si tous ses policy packages réussissent ;
+- une erreur sur un ADOM ne bloque jamais l'ADOM suivant ;
+- Redis est toujours reconstructible depuis MySQL.
+```
+
+---
+
+# PARTIE A — MODÈLES ET DONNÉES
+
+## 2. Conserver le modèle `FortiManager` existant autant que possible
+
+L’objectif est d’éviter toute régression.
+
+On ne modifie le modèle existant que si nécessaire.
+
+Il est toutefois fortement recommandé que chaque FortiManager possède un identifiant technique stable et non réutilisable :
+
+```python
+uid = models.UUIDField(
+    default=uuid.uuid4,
+    unique=True,
+    editable=False,
+)
+```
+
+Ce `uid` servira notamment :
+
+```text
+- aux clés Redis ;
+- aux locks ;
+- à l'identification historique des ADOMs ;
+- au nettoyage après suppression du FortiManager.
+```
+
+---
+
+## 3. Créer le modèle `Adom`
+
+L’unité de stockage devient :
+
+```text
+1 FortiManager
++
+1 ADOM
+=
+1 ligne MySQL
+```
+
+Un FortiManager possède donc plusieurs ADOMs.
+
+La relation reste une `ForeignKey`, mais avec :
+
+```python
+on_delete=models.SET_NULL
+```
+
+et non `CASCADE`.
+
+Exemple :
+
+```python
+fortimanager = models.ForeignKey(
+    "FortiManager",
+    on_delete=models.SET_NULL,
+    null=True,
+    blank=True,
+    related_name="daily_policy_adoms",
+)
+```
+
+Ainsi :
+
+```text
+suppression FMG
+       ↓
+ADOMs restent temporairement en DB
+       ↓
+fortimanager_id = NULL
+       ↓
+cleanup les détectera
+```
+
+---
+
+## 4. Conserver l'identité historique du FortiManager dans l'ADOM
+
+Comme `SET_NULL` efface la FK, chaque ADOM doit conserver :
+
+```python
+source_fmg_uid = models.UUIDField(
+    editable=False,
+)
+```
+
+Ce champ est renseigné lors de la création de l’ADOM et ne change plus.
+
+Exemple :
+
+```text
+fortimanager = NULL
+source_fmg_uid = 92ab...
+name = PROD
+```
+
+La tâche de nettoyage peut encore déterminer quelles clés Redis appartenaient à cet ADOM.
+
+---
+
+## 5. Stocker les règles dans un `JSONField`
+
+Le modèle contient :
+
+```python
+rules = models.JSONField(
+    default=list,
+)
+```
+
+Les règles de **tous les policy packages réussis de l’ADOM** sont regroupées dans ce JSON.
+
+Mais cette nouvelle valeur n’est enregistrée que lorsque :
+
+```text
+100 % des policy packages de l'ADOM ont réussi
+```
+
+---
+
+## 6. Préserver le contexte de chaque règle
+
+Chaque règle doit permettre de retrouver son origine.
+
+Il ne faut donc pas supposer qu’un simple :
+
+```text
+policyid = 123
+```
+
+est nécessairement unique dans tout l’ADOM.
+
+Le JSON devra préserver au minimum si disponibles :
+
+```text
+package
+vdom
+policyid
+nom
+interfaces
+addresses
+services
+action
+status
+...
+```
+
+---
+
+## 7. Ajouter `schema_version`
+
+Le JSON doit pouvoir évoluer.
+
+Ajouter :
+
+```python
+schema_version = models.PositiveIntegerField(default=1)
+```
+
+Cela permettra plus tard de distinguer :
+
+```text
+format JSON v1
+format JSON v2
+...
+```
+
+sans rendre les anciennes données impossibles à interpréter.
+
+---
+
+## 8. Ajouter `sync_status`
+
+Je préfère finalement appeler le champ :
+
+```python
+sync_status
+```
+
+plutôt que simplement `status`.
+
+Valeurs possibles :
+
+```text
+SUCCESS
+FAILED
+MISSING
+INACTIVE
+```
+
+Cela représente **le résultat du cycle de synchronisation**, pas la validité intrinsèque du JSON actuellement stocké.
+
+---
+
+## 9. Ajouter `failure_reason`
+
+```python
+failure_reason = models.TextField(
+    blank=True,
+    default="",
+)
+```
+
+Il contient un résumé lisible de l’échec.
+
+Exemple :
+
+```text
+"Policy package PKG_DMZ failed after 3 attempts"
+```
+
+---
+
+## 10. Ajouter `failed_packages`
+
+Pour le détail structuré :
+
+```python
+failed_packages = models.JSONField(
+    default=list,
+    blank=True,
+)
+```
+
+Exemple :
+
+```json
+[
+  {
+    "package": "PKG_DMZ",
+    "error_type": "ReadTimeout",
+    "message": "Read timeout after 120 seconds",
+    "retry_count": 3
+  }
+]
+```
+
+---
+
+## 11. Ajouter les compteurs de packages
+
+```python
+package_count
+successful_package_count
+failed_package_count
+```
+
+Ils permettent d’obtenir :
+
+```text
+8 packages attendus
+7 réussis
+1 échoué
+→ ADOM FAILED
+```
+
+---
+
+## 12. Ajouter `rules_count`
+
+```python
+rules_count = models.PositiveIntegerField(default=0)
+```
+
+Il représente le nombre de règles du **dernier dataset entièrement valide**.
+
+---
+
+## 13. Ajouter `data_version`
+
+```python
+data_version = models.CharField(...)
+```
+
+Cette version identifie le dataset valide actuellement stocké dans MySQL.
+
+Elle change uniquement lorsque :
+
+```text
+tous les packages réussissent
++
+validation complète réussit
++
+nouveau JSON enregistré
+```
+
+---
+
+## 14. Ajouter `cache_version`
+
+```python
+cache_version = models.CharField(...)
+```
+
+C’est une métadonnée indiquant la dernière version que notre application pense avoir publiée dans Redis.
+
+Mais :
+
+```text
+data_version
+= vérité du dataset DB
+
+Redis current
+= vérité réelle du cache
+
+cache_version
+= information de suivi
+```
+
+Le reconciler ne doit donc jamais considérer `cache_version` seul comme preuve absolue.
+
+---
+
+## 15. Ajouter les dates techniques
+
+On garde :
+
+```text
+last_seen_at
+last_attempt_at
+last_success_at
+last_failed_at
+created_at
+updated_at
+deleted_at
+```
+
+Rôle :
+
+```text
+last_seen_at
+→ dernière présence confirmée dans la liste officielle des ADOMs FMG
+
+last_attempt_at
+→ dernière tentative d'extraction
+
+last_success_at
+→ dernière extraction complètement valide
+
+last_failed_at
+→ dernier échec
+
+created_at
+→ création DB
+
+updated_at
+→ modification technique DB
+
+deleted_at
+→ date du soft-delete
+```
+
+`updated_at` ne doit jamais servir à décider qu’un ADOM existe encore ou non.
+
+---
+
+## 16. Ajouter `consecutive_missing_count`
+
+```python
+consecutive_missing_count = models.PositiveIntegerField(default=0)
+```
+
+Le seuil choisi est :
+
+```text
+2 synchronisations FMG valides consécutives
+```
+
+Il doit être configurable :
+
+```python
+ADOM_MISSING_THRESHOLD = 2
+```
+
+---
+
+## 17. Ajouter `is_active`
+
+```python
+is_active = models.BooleanField(default=True)
+```
+
+Cela permet :
+
+```text
+ADOM présent → True
+ADOM confirmé disparu → False
+```
+
+sans suppression physique immédiate.
+
+---
+
+## 18. Contrainte d'unicité
+
+Comme `fortimanager` peut devenir `NULL`, l’identité durable repose sur :
+
+```text
+source_fmg_uid + name
+```
+
+Donc :
+
+```python
+UniqueConstraint(
+    fields=["source_fmg_uid", "name"],
+    name="uniq_daily_policy_source_fmg_adom",
+)
+```
+
+---
+
+# PARTIE B — MODÈLES DE SUIVI
+
+## 19. Créer `SyncRun`
+
+Chaque synchronisation quotidienne crée un objet `SyncRun`.
+
+Champs recommandés :
+
+```text
+id
+trigger
+
+status
+
+started_at
+extraction_finished_at
+cache_started_at
+finished_at
+
+fortimanager_total
+fortimanager_success
+fortimanager_failed
+
+adom_total
+adom_success
+adom_failed
+adom_missing
+
+previous_adom_total
+current_adom_total
+
+error_message
+
+created_at
+```
+
+Statuts possibles :
+
+```text
+PENDING
+RUNNING
+READY_FOR_CACHE
+CACHE_RUNNING
+SUCCESS
+PARTIAL
+FAILED
+SKIPPED_LOCKED
+```
+
+---
+
+## 20. Créer `AdomSyncResult`
+
+Il est préférable de ne pas utiliser le modèle `Adom` comme journal historique.
+
+Créer :
+
+```text
+sync_run
+adom
+fmg_uid
+adom_name
+
+status
+
+started_at
+finished_at
+
+package_count
+package_success
+package_failed
+
+rules_count
+response_size
+
+retry_count
+
+error_type
+error_message
+```
+
+Cela donne un véritable audit par run.
+
+---
+
+## 21. `PackageSyncResult` reste optionnel
+
+Si le niveau d’audit doit être très détaillé, on pourra créer :
+
+```text
+PackageSyncResult
+```
+
+avec :
+
+```text
+adom_sync_result
+package_name
+status
+rules_count
+started_at
+finished_at
+retry_count
+error_type
+error_message
+```
+
+Sinon `failed_packages` et `AdomSyncResult` peuvent suffire dans un premier temps.
+
+---
+
+# PARTIE C — LES 4 TÂCHES CELERY
+
+## 22. Nombre final : 4 tâches Celery principales
+
+Nous retenons exactement :
+
+```text
+1. extract_daily_rules
+2. refresh_rules_cache
+3. reconcile_rules_cache
+4. cleanup_daily_rules
+```
+
+---
+
+# PARTIE D — TÂCHE 1 : EXTRACTION
+
+## 23. Planifier `extract_daily_rules`
+
+Celery Beat la déclenche chaque jour :
+
+```text
+14:02
+Europe/Paris
+```
+
+Beat ne fait aucune extraction lui-même.
+
+Il lance simplement la tâche.
+
+---
+
+## 24. Créer un `SyncRun`
+
+Au démarrage :
+
+```text
+SyncRun
+status = RUNNING
+started_at = now
+trigger = BEAT
+```
+
+---
+
+## 25. Récupérer uniquement les FortiManagers actifs
+
+Exemple :
+
+```python
+FortiManager.objects.filter(is_active=True)
+```
+
+Aucun FMG legacy ou désactivé ne doit être inclus par accident.
+
+---
+
+# PARTIE E — LOCK EXTRACTION
+
+## 26. Utiliser un lock exclusivement dédié à cette fonctionnalité
+
+Clé :
+
+```text
+lock:daily-policy-sync:extraction:fmg:{uid}
+```
+
+Ce lock :
+
+```text
+- ne verrouille pas le FortiManager ;
+- ne bloque pas son GUI ;
+- ne bloque pas ses autres API ;
+- ne bloque pas les tâches legacy ;
+- ne bloque pas MySQL ;
+- ne bloque pas Redis.
+```
+
+Il empêche uniquement **deux instances de notre nouvelle extraction quotidienne** de traiter simultanément le même FMG.
+
+---
+
+## 27. Le lock utilise un TTL fixe
+
+Nous avons décidé de **ne pas implémenter de heartbeat ni de renouvellement du lock**.
+
+Le TTL sera simplement largement supérieur au temps maximal réel prévu.
+
+Exemple :
+
+```text
+extraction attendue < 2 heures
+TTL = 3 heures
+```
+
+ou valeur similaire configurable.
+
+---
+
+# PARTIE F — ISOLATION TOTALE DU LEGACY
+
+## 28. Aucun mécanisme de cette fonctionnalité ne doit être global
+
+Créer si nécessaire un client spécifique :
+
+```text
+DailyPolicySyncFortiManagerClient
+```
+
+Il contient :
+
+```text
+timeouts propres
+retries propres
+URLs propres
+validation propre
+```
+
+On ne modifie pas un ancien client FMG partagé si cela peut changer le comportement des anciennes tâches.
+
+---
+
+## 29. Les timeouts s'appliquent uniquement à cette fonctionnalité
+
+Chaque requête de cette nouvelle extraction possède son propre timeout :
+
+```text
+connect timeout
+read timeout
+```
+
+Par exemple configurable :
+
+```python
+DAILY_POLICY_CONNECT_TIMEOUT
+DAILY_POLICY_READ_TIMEOUT
+```
+
+Cela ne change absolument rien aux anciennes tâches.
+
+---
+
+# PARTIE G — RÉCUPÉRATION DES ADOMS
+
+## 30. Récupérer d'abord la liste complète des ADOMs du FMG
+
+Avant les policies :
+
+```text
+FMG
+ ↓
+GET liste ADOMs
+```
+
+Cette liste sert :
+
+```text
+- à déterminer les ADOMs à traiter ;
+- à actualiser last_seen_at ;
+- à détecter les ADOMs disparus.
+```
+
+---
+
+## 31. Si la récupération de la liste ADOM échoue, ne rien conclure sur les absences
+
+Exemple :
+
+```text
+timeout FMG
+```
+
+Alors :
+
+```text
+aucun consecutive_missing_count n'est incrémenté
+```
+
+Une erreur FMG ne doit jamais faire croire que tous ses ADOMs ont disparu.
+
+---
+
+# PARTIE H — BAISSE IMPORTANTE DU NOMBRE D'ADOMS
+
+## 32. Ne pas bloquer une baisse massive
+
+Nous avons explicitement décidé de **ne pas implémenter de mécanisme bloquant**.
+
+Exemple :
+
+```text
+hier : 80 ADOMs
+aujourd'hui : 20 ADOMs
+```
+
+Le traitement continue normalement.
+
+Les ADOMs absents suivent le mécanisme normal :
+
+```text
+consecutive_missing_count += 1
+```
+
+---
+
+## 33. Signaler la baisse uniquement dans le mail final
+
+Le mail final pourra contenir :
+
+```text
+WARNING
+
+FMG: FMG-PARIS
+
+Previous ADOM count: 80
+Current ADOM count: 20
+Difference: -60
+Variation: -75 %
+```
+
+Mais :
+
+```text
+aucun arrêt
+aucun rollback
+aucun blocage
+```
+
+---
+
+# PARTIE I — EXTRACTION ADOM PAR ADOM
+
+## 34. Traiter séquentiellement les ADOMs d'un même FMG
+
+Configuration initiale :
+
+```text
+1 ADOM à la fois par FortiManager
+```
+
+Donc :
+
+```text
+ADOM1
+ ↓
+ADOM2
+ ↓
+ADOM3
+ ↓
+...
+```
+
+Cela protège le FMG contre une forte concurrence de gros appels.
+
+---
+
+## 35. Plusieurs FortiManagers peuvent être parallélisés
+
+Par exemple :
+
+```text
+FMG1 → ADOM1 → ADOM2...
+FMG2 → ADOM1 → ADOM2...
+```
+
+Chaque FMG possède son propre lock.
+
+---
+
+# PARTIE J — POLICY PACKAGES
+
+## 36. Récupérer la liste des policy packages de l'ADOM
+
+Pour chaque ADOM :
+
+```text
+récupérer tous les packages concernés
+```
+
+Puis traiter chacun.
+
+---
+
+## 37. Faire un GET complet des policies de chaque package
+
+Conformément à ton choix :
+
+```text
+pas de chunk FortiManager
+pas de pagination FortiManager
+```
+
+Pour chaque package :
+
+```text
+GET complet des policies
+```
+
+---
+
+## 38. Construire le nouveau dataset uniquement en mémoire de travail
+
+Exemple :
+
+```text
+new_rules = []
+
+PACKAGE A SUCCESS
+→ ajoute dans new_rules
+
+PACKAGE B SUCCESS
+→ ajoute dans new_rules
+
+PACKAGE C FAILED
+→ abandon du nouveau dataset
+```
+
+Les packages réussis précédemment ne doivent jamais être partiellement publiés.
+
+---
+
+## 39. Définition exacte d'un ADOM réussi
+
+Règle définitive :
+
+```text
+ADOM SUCCESS
+⇔
+tous ses policy packages sont SUCCESS
+```
+
+Exemple :
+
+```text
+8 packages
+8 SUCCESS
+→ ADOM SUCCESS
+```
+
+Mais :
+
+```text
+8 packages
+7 SUCCESS
+1 FAILED
+→ ADOM FAILED
+```
+
+---
+
+## 40. Une erreur d'ADOM ne bloque jamais l'ADOM suivant
+
+Exemple :
+
+```text
+ADOM_A → FAILED
+ADOM_B → continue
+ADOM_C → continue
+ADOM_D → continue
+```
+
+L’exception est uniquement une panne réellement globale, par exemple :
+
+```text
+MySQL totalement inaccessible
+configuration fondamentale invalide
+```
+
+---
+
+# PARTIE K — RETRIES
+
+## 41. Trois retries maximum
+
+Toutes nos nouvelles tâches importantes disposent de :
+
+```text
+max_retries = 3
+```
+
+Mais uniquement pour les erreurs transitoires.
+
+---
+
+## 42. Retrier les erreurs transitoires
+
+Par exemple :
+
+```text
+timeout réseau
+connection reset
+Redis temporairement indisponible
+MySQL temporairement indisponible
+FMG temporairement indisponible
+```
+
+Avec backoff.
+
+---
+
+## 43. Ne pas retrier les erreurs métier déterministes
+
+Pas de retry inutile pour :
+
+```text
+structure JSON invalide
+réponse FMG cohérente techniquement mais métier invalide
+package inexploitable
+champ obligatoire absent
+données clairement corrompues
+```
+
+---
+
+# PARTIE L — VALIDATION
+
+## 44. Valider chaque réponse package
+
+Avant intégration dans `new_rules`, vérifier :
+
+```text
+HTTP/RPC correct
+code FMG correct
+JSON correct
+liste de policies correcte
+structure attendue correcte
+identifiants présents
+package cohérent
+ADOM cohérent
+```
+
+---
+
+## 45. Gérer correctement un package vide
+
+Un package contenant :
+
+```text
+0 policy
+```
+
+peut être parfaitement valide.
+
+Il est `SUCCESS` si :
+
+```text
+appel réussi
+réponse valide
+package réellement vide
+```
+
+---
+
+## 46. Gérer correctement un ADOM complètement vide
+
+Si tous les packages réussissent et contiennent 0 règle :
+
+```text
+ADOM SUCCESS
+rules = []
+rules_count = 0
+```
+
+Il ne faut pas considérer `[]` comme automatiquement suspect.
+
+---
+
+# PARTIE M — ÉCRITURE MYSQL
+
+## 47. N'écrire le nouveau JSON que si tout l'ADOM réussit
+
+Lorsque tous les packages sont validés :
+
+```text
+transaction courte
+```
+
+puis :
+
+```text
+rules = new_rules
+rules_count = len(new_rules)
+sync_status = SUCCESS
+
+package_count = X
+successful_package_count = X
+failed_package_count = 0
+
+failure_reason = ""
+failed_packages = []
+
+last_seen_at = now
+last_attempt_at = now
+last_success_at = now
+
+consecutive_missing_count = 0
+
+is_active = True
+deleted_at = NULL
+
+data_version = nouvelle version
+```
+
+---
+
+## 48. En cas d'échec, ne pas écraser le dernier dataset valide
+
+Si un seul package échoue :
+
+```text
+rules
+rules_count
+data_version
+last_success_at
+```
+
+restent inchangés.
+
+On met seulement :
+
+```text
+sync_status = FAILED
+last_attempt_at = now
+last_failed_at = now
+
+package_count
+successful_package_count
+failed_package_count
+
+failure_reason
+failed_packages
+```
+
+---
+
+# PARTIE N — ADOMS DISPARUS
+
+## 49. Comparer les ADOMs DB aux ADOMs réellement retournés par FMG
+
+Après récupération réussie de la liste :
+
+```text
+ADOMs connus en DB
+-
+ADOMs retournés aujourd'hui
+=
+ADOMs potentiellement disparus
+```
+
+---
+
+## 50. Incrémenter le compteur uniquement sur une liste FMG valide
+
+Pour chaque absent :
+
+```text
+consecutive_missing_count += 1
+sync_status = MISSING
+```
+
+---
+
+## 51. Le seuil retenu est 2
+
+```text
+Jour 1 absent
+→ count = 1
+
+Jour 2 absent
+→ count = 2
+```
+
+À partir de :
+
+```text
+count >= 2
+```
+
+l’ADOM est considéré confirmé disparu.
+
+---
+
+## 52. Effectuer d'abord un soft-delete
+
+À `count >= 2` :
+
+```text
+sync_status = INACTIVE
+is_active = False
+deleted_at = now
+```
+
+Mais pas nécessairement suppression physique immédiate.
+
+---
+
+## 53. Gérer la réapparition d'un ADOM
+
+Si un ADOM avec :
+
+```text
+MISSING
+ou
+INACTIVE mais pas encore purgé
+```
+
+réapparaît :
+
+```text
+consecutive_missing_count = 0
+is_active = True
+deleted_at = NULL
+```
+
+puis extraction normale.
+
+---
+
+# PARTIE O — FIN DE L'EXTRACTION
+
+## 54. Terminer tous les FMG avant Redis
+
+Principe strict :
+
+```text
+TOUS les traitements FMG/MySQL
+doivent être terminés
+avant le cache.
+```
+
+Donc :
+
+```text
+FortiManager → MySQL
+
+FIN complète extraction
+
+MySQL → Redis
+```
+
+---
+
+## 55. Finaliser le `SyncRun`
+
+Calculer :
+
+```text
+fmg success/failed
+adom success/failed/missing
+previous_adom_total
+current_adom_total
+```
+
+et stocker :
+
+```text
+extraction_finished_at
+```
+
+---
+
+## 56. Passer `SyncRun` à `READY_FOR_CACHE`
+
+Lorsque tous les éléments ont atteint un état final :
+
+```text
+SUCCESS
+FAILED
+MISSING
+SKIPPED
+```
+
+alors :
+
+```text
+SyncRun.status = READY_FOR_CACHE
+```
+
+Même s’il existe certains ADOMs FAILED.
+
+---
+
+# PARTIE P — TÂCHE 2 : REFRESH CACHE
+
+## 57. Déclencher explicitement `refresh_rules_cache`
+
+Après commit du `SyncRun` :
+
+```python
+refresh_rules_cache.delay(sync_run_id)
+```
+
+La tâche reçoit uniquement :
+
+```text
+sync_run_id
+```
+
+Jamais les centaines de Mo de rules via Celery.
+
+---
+
+## 58. La tâche cache relit MySQL
+
+Elle charge :
+
+```text
+SyncRun
++
+ADOMs correspondant aux données valides
+```
+
+et ne contacte jamais FortiManager.
+
+---
+
+# PARTIE Q — NAMESPACE REDIS
+
+## 59. Utiliser un namespace totalement exclusif
+
+Par exemple :
+
+```text
+daily-policy-sync:
+```
+
+Exemples :
+
+```text
+daily-policy-sync:fmg:{uid}:adom:{name}:current
+
+daily-policy-sync:fmg:{uid}:adom:{name}:data:{version}
+```
+
+Aucune clé legacy ne doit utiliser ce namespace.
+
+---
+
+## 60. Interdiction absolue de supprimer une clé hors namespace
+
+Toutes les opérations de nettoyage doivent vérifier :
+
+```text
+key.startswith("daily-policy-sync:")
+```
+
+Une ancienne clé Redis du projet ne doit jamais être :
+
+```text
+modifiée
+écrasée
+renommée
+UNLINK
+DEL
+expire
+```
+
+par cette fonctionnalité.
+
+---
+
+# PARTIE R — LOCK CACHE
+
+## 61. Utiliser une deuxième famille de locks
+
+Clé :
+
+```text
+lock:daily-policy-sync:cache:fmg:{uid}:adom:{name}
+```
+
+Elle est utilisée par :
+
+```text
+refresh_rules_cache
++
+reconcile_rules_cache
+```
+
+---
+
+## 62. Le lock cache ne verrouille pas Redis
+
+Il empêche simplement deux nouvelles tâches de reconstruire simultanément :
+
+```text
+le même ADOM
+```
+
+Les autres ADOMs continuent normalement.
+
+---
+
+# PARTIE S — PREMIER REMPLISSAGE REDIS
+
+## 63. Premier cache lorsque Redis est vide
+
+Exemple :
+
+```text
+current absent
+```
+
+La tâche crée :
+
+```text
+data:V123
+```
+
+puis :
+
+```text
+current = V123
+```
+
+Aucun ancien objet n’a besoin d’être supprimé.
+
+---
+
+# PARTIE T — MISE À JOUR CACHE
+
+## 64. Ne jamais écraser directement la version courante
+
+Supposons :
+
+```text
+current = V122
+DB = V123
+```
+
+Construire d’abord :
+
+```text
+data:V123
+```
+
+---
+
+## 65. Ajouter une enveloppe au payload Redis
+
+Exemple :
+
+```json
+{
+  "schema_version": 1,
+  "fmg_uid": "...",
+  "adom": "PROD",
+  "data_version": "V123",
+  "rules_count": 8127,
+  "generated_at": "...",
+  "rules": [...]
+}
+```
+
+---
+
+## 66. Valider NEW avant publication
+
+Vérifier :
+
+```text
+clé existante
+payload JSON lisible
+schema_version correcte
+fmg_uid correct
+adom correct
+data_version correcte
+rules_count correct
+```
+
+---
+
+## 67. Faire la bascule atomique du pointeur
+
+Une fois validé :
+
+```text
+SET current V123
+```
+
+Pendant la construction :
+
+```text
+API → V122
+```
+
+Après bascule :
+
+```text
+API → V123
+```
+
+---
+
+## 68. Supprimer uniquement l'ancienne version appartenant à notre namespace
+
+Après switch réussi :
+
+```text
+UNLINK data:V122
+```
+
+Jamais avant.
+
+Jamais sur une clé legacy.
+
+---
+
+## 69. Mettre à jour `cache_version`
+
+Après publication réussie :
+
+```text
+cache_version = data_version
+```
+
+---
+
+# PARTIE U — TÂCHE 3 : RECONCILER
+
+## 70. Planifier `reconcile_rules_cache`
+
+Par exemple :
+
+```text
+toutes les 5 ou 10 minutes
+```
+
+Le rythme reste configurable.
+
+---
+
+## 71. Le reconciler doit être léger
+
+Il ne doit pas lire tous les JSON MySQL de ~8 Mo toutes les 5 minutes.
+
+Il lit d’abord uniquement :
+
+```text
+source_fmg_uid
+adom
+data_version
+cache_version
+```
+
+et :
+
+```text
+Redis current
+```
+
+---
+
+## 72. Cas cache valide
+
+```text
+DB data_version = V123
+Redis current = V123
+```
+
+Alors :
+
+```text
+rien à faire
+```
+
+---
+
+## 73. Cas cache absent
+
+```text
+DB = V123
+Redis current absent
+```
+
+Alors :
+
+```text
+charger rules depuis MySQL
+reconstruire V123
+publier
+```
+
+---
+
+## 74. Cas cache obsolète
+
+```text
+DB = V123
+Redis current = V122
+```
+
+Alors :
+
+```text
+rebuild V123
+```
+
+---
+
+## 75. Cas Redis correct mais `cache_version` MySQL incorrect
+
+```text
+DB data_version = V123
+Redis current = V123
+cache_version = V122
+```
+
+Ne pas reconstruire inutilement.
+
+Simplement corriger :
+
+```text
+cache_version = V123
+```
+
+---
+
+## 76. Le reconciler gère aussi la perte totale de Redis
+
+Après :
+
+```text
+Redis restart
+FLUSH
+cache perdu
+```
+
+il reconstruit tout depuis MySQL.
+
+Aucun appel FMG nécessaire.
+
+---
+
+# PARTIE V — CRASH ENTRE TASK 1 ET TASK 2
+
+## 77. Gérer `READY_FOR_CACHE` bloqué
+
+Cas :
+
+```text
+SyncRun = READY_FOR_CACHE
+```
+
+puis process crash avant :
+
+```text
+refresh_rules_cache.delay(...)
+```
+
+Le reconciler finira de toute façon par détecter :
+
+```text
+DB version != Redis
+```
+
+et reconstruira.
+
+On peut aussi lui faire détecter les `SyncRun READY_FOR_CACHE` anciens pour améliorer la visibilité.
+
+---
+
+# PARTIE W — IDEMPOTENCE
+
+## 78. Toutes les tâches doivent être idempotentes
+
+Une tâche retentée ne doit pas créer des effets doubles.
+
+Exemple :
+
+```text
+V123 déjà créé
+retry refresh
+```
+
+Elle doit pouvoir :
+
+```text
+détecter V123
+valider
+finir le switch
+```
+
+sans créer :
+
+```text
+V123-copy
+V123-copy2
+```
+
+---
+
+# PARTIE X — TÂCHE 4 : CLEANUP
+
+## 79. Planifier `cleanup_daily_rules`
+
+Elle est périodique.
+
+Son rôle :
+
+```text
+ADOMs orphelins
+ADOMs soft-deleted
+versions Redis abandonnées
+FMG supprimés
+```
+
+---
+
+## 80. Cas FortiManager supprimé
+
+Grâce à :
+
+```python
+on_delete=SET_NULL
+```
+
+on obtient :
+
+```text
+fortimanager = NULL
+source_fmg_uid toujours présent
+```
+
+C’est un orphelin certain.
+
+Il n’y a donc pas besoin de `consecutive_missing_count`.
+
+---
+
+## 81. Nettoyer le cache du FMG/ADOM supprimé
+
+La tâche utilise :
+
+```text
+source_fmg_uid
++
+adom.name
+```
+
+pour cibler uniquement :
+
+```text
+daily-policy-sync:fmg:{uid}:adom:{name}:*
+```
+
+---
+
+## 82. Si Redis est indisponible, ne pas perdre l'ADOM
+
+Le nettoyage échoue :
+
+```text
+retry jusqu'à 3 fois
+```
+
+et l’ADOM reste en base.
+
+Une future exécution pourra recommencer.
+
+C’est précisément l’intérêt de `SET_NULL`.
+
+---
+
+## 83. Supprimer ensuite l'ADOM MySQL
+
+Une fois le nettoyage nécessaire terminé :
+
+```text
+DELETE Adom
+```
+
+---
+
+## 84. Nettoyer les ADOMs soft-deleted
+
+Pour les ADOMs devenus :
+
+```text
+INACTIVE
+deleted_at != NULL
+```
+
+la tâche pourra appliquer un délai configurable avant purge physique.
+
+Exemple :
+
+```text
+ADOM_SOFT_DELETE_RETENTION_DAYS
+```
+
+---
+
+# PARTIE Y — VERSIONS REDIS ORPHELINES
+
+## 85. Gérer les versions abandonnées après crash
+
+Exemple :
+
+```text
+current = V122
+data:V123 existe
+crash avant switch
+```
+
+V123 devient temporairement inutilisée.
+
+La tâche cleanup pourra supprimer les versions :
+
+```text
+non current
++
+suffisamment anciennes
++
+appartenant exclusivement à daily-policy-sync
+```
+
+---
+
+# PARTIE Z — EMAIL FINAL
+
+## 86. Produire un mail de synthèse final
+
+Le mail concerne le run quotidien.
+
+Il doit présenter au minimum :
+
+```text
+date / heure
+durée totale
+
+nombre de FMG
+FMG success
+FMG failed
+
+nombre d'ADOMs
+ADOM success
+ADOM failed
+ADOM missing
+
+nombre total de règles valides extraites
+
+packages failed
+
+retries éventuels
+
+erreurs principales
+```
+
+---
+
+## 87. Inclure les variations du nombre d'ADOMs dans le mail
+
+Conformément à ta décision :
+
+```text
+aucun blocage
+aucune protection automatique
+```
+
+Mais signaler :
+
+```text
+FMG-A:
+Yesterday: 80
+Today: 71
+Difference: -9
+```
+
+ou variation positive.
+
+---
+
+## 88. Inclure les détails des ADOMs échoués
+
+Exemple :
+
+```text
+ADOM PROD
+Status: FAILED
+
+Packages: 8
+Success: 7
+Failed: 1
+
+Failed package:
+PKG_DMZ
+
+Reason:
+ReadTimeout after 3 retries
+```
+
+---
+
+# PARTIE AA — FILES / QUEUES CELERY
+
+## 89. Séparer les queues
+
+Recommandation :
+
+```text
+fmg_extraction
+cache
+maintenance
+notifications
+```
+
+Par exemple :
+
+```text
+extract_daily_rules → fmg_extraction
+
+refresh_rules_cache → cache
+
+reconcile_rules_cache → cache ou maintenance
+
+cleanup_daily_rules → maintenance
+```
+
+Cela évite qu’un long cleanup bloque les extractions.
+
+---
+
+# PARTIE AB — MÉMOIRE ET PERFORMANCE
+
+## 90. Ne traiter qu'un gros JSON à la fois
+
+Un JSON de 8 Mo compressé/réseau peut devenir beaucoup plus gros sous forme d’objets Python.
+
+Donc :
+
+```text
+GET ADOM
+validate
+save
+release references
+
+puis ADOM suivant
+```
+
+Même principe pour Redis.
+
+---
+
+## 91. Benchmarker le `JSONField`
+
+Avant production, mesurer :
+
+```text
+temps INSERT/UPDATE
+temps SELECT
+CPU sérialisation
+RAM worker
+taille DB
+temps backup
+```
+
+Avec ton ordre de grandeur :
+
+```text
+~8 Mo / ADOM
+~80 ADOMs / FMG
+≈640 Mo brut / FMG
+```
+
+plus les index, métadonnées et overhead MySQL.
+
+---
+
+## 92. Vérifier la configuration MySQL
+
+Notamment :
+
+```text
+max_allowed_packet
+timeouts
+taille des connexions
+espace disque
+backup
+```
+
+---
+
+# PARTIE AC — FUTURE API DRF
+
+## 93. L'API doit privilégier Redis
+
+Flux futur :
+
+```text
+GET rules
+    ↓
+ADOM demandé
+    ↓
+Redis current existe et valide ?
+    ├── oui → Redis
+    └── non → MySQL
+```
+
+---
+
+## 94. MySQL doit permettre le fallback
+
+Même si Redis est down :
+
+```text
+API → MySQL rules JSON
+```
+
+La fonctionnalité reste disponible, éventuellement plus lentement.
+
+---
+
+## 95. Exposer l'âge des données
+
+Si aujourd’hui l’extraction échoue mais que les données d’hier existent :
+
+```text
+sync_status = FAILED
+rules = données valides d'hier
+```
+
+L’API pourra renvoyer :
+
+```json
+{
+  "sync_status": "FAILED",
+  "last_success_at": "...",
+  "data_version": "...",
+  "rules_count": 8127,
+  "rules": [...]
+}
+```
+
+Ainsi le client sait que les données sont disponibles mais pas issues du dernier run réussi.
+
+---
+
+# PARTIE AD — TESTS OBLIGATOIRES
+
+## 96. Tester le premier démarrage
+
+```text
+MySQL vide
+Redis vide
+```
+
+Vérifier :
+
+```text
+création ADOMs
+écriture rules
+création cache
+création current
+```
+
+---
+
+## 97. Tester un ADOM 100 % réussi
+
+Tous packages réussissent :
+
+```text
+SUCCESS
+nouveau JSON écrit
+data_version change
+cache reconstruit
+```
+
+---
+
+## 98. Tester un package en erreur
+
+```text
+Package A SUCCESS
+Package B FAILED
+Package C SUCCESS
+```
+
+Résultat :
+
+```text
+ADOM FAILED
+ancien JSON conservé
+failure_reason renseigné
+failed_packages renseigné
+ADOM suivant traité
+```
+
+---
+
+## 99. Tester les retries
+
+Tester :
+
+```text
+timeout temporaire
+retry 1
+retry 2
+success
+```
+
+et :
+
+```text
+3 retries épuisés
+→ FAILED
+```
+
+---
+
+## 100. Tester un ADOM vide
+
+Tous les packages réussissent mais aucune règle :
+
+```text
+SUCCESS
+rules = []
+```
+
+---
+
+## 101. Tester un ADOM disparu
+
+```text
+jour 1 absent → 1
+jour 2 absent → 2
+→ INACTIVE / soft-delete
+```
+
+---
+
+## 102. Tester la réapparition
+
+```text
+MISSING
+→ ADOM revient
+→ compteur 0
+→ actif
+→ extraction
+```
+
+---
+
+## 103. Tester un FortiManager supprimé
+
+```text
+DELETE FMG
+→ Adom.fortimanager = NULL
+→ source_fmg_uid conservé
+→ cleanup Redis
+→ suppression Adom
+```
+
+---
+
+## 104. Tester Redis indisponible pendant cleanup
+
+Vérifier que :
+
+```text
+l'ADOM reste en DB
+```
+
+et peut être nettoyé plus tard.
+
+---
+
+## 105. Tester Redis vidé
+
+```text
+FLUSH
+```
+
+Puis vérifier :
+
+```text
+reconciler
+→ reconstruction depuis MySQL
+```
+
+---
+
+## 106. Tester deux extractions simultanées
+
+Pour le même FMG :
+
+```text
+Task A → lock obtenu
+Task B → SKIPPED_LOCKED
+```
+
+Mais les tâches legacy doivent rester totalement inchangées.
+
+---
+
+## 107. Tester deux rebuild cache simultanés
+
+```text
+refresh
++
+reconciler
+```
+
+sur le même ADOM :
+
+```text
+une seule tâche reconstruit
+```
+
+---
+
+## 108. Tester explicitement la non-régression legacy
+
+C’est un test à part entière.
+
+Avant/après déploiement :
+
+```text
+anciennes tâches
+anciennes clés Redis
+anciens timeouts
+anciens retries
+anciens endpoints
+```
+
+doivent conserver exactement leur comportement.
+
+---
+
+# PARTIE AE — CE QUE NOUS N'IMPLÉMENTONS PAS
+
+## 109. Pas de protection bloquante sur baisse massive d'ADOMs
+
+Nous n’implémentons pas :
+
+```text
+si -70 % ADOMs
+→ arrêter sync
+```
+
+Non.
+
+Nous faisons seulement :
+
+```text
+traitement normal
++
+signalement mail final
+```
+
+---
+
+## 110. Pas de heartbeat du lock
+
+Nous n’implémentons pas :
+
+```text
+renouvellement automatique du TTL
+heartbeat
+watchdog du lock
+```
+
+Le TTL est simplement suffisamment large.
+
+---
+
+## 111. Pas de modification du legacy
+
+Nous n’implémentons pas de mécanisme global qui forcerait les anciennes tâches à utiliser :
+
+```text
+nos locks
+nos timeouts
+nos retries
+nos caches
+```
+
+---
+
+## 112. Pas de suppression générique Redis
+
+Interdit :
+
+```text
+KEYS *
+FLUSHDB
+DEL générique
+SCAN puis suppression sans namespace précis
+```
+
+Notre fonctionnalité ne touche qu’à :
+
+```text
+daily-policy-sync:*
+```
+
+---
+
+# PARTIE AF — FLUX FINAL COMPLET
+
+## 113. Workflow quotidien
+
+```text
+                         14:02
+                           │
+                           ▼
+                     CELERY BEAT
+                           │
+                           ▼
+                extract_daily_rules
+                           │
+                           ▼
+                     créer SyncRun
+                           │
+                           ▼
+                récupérer FMG actifs
+                           │
+                           ▼
+          lock extraction propre à notre feature
+                           │
+                           ▼
+               récupérer liste des ADOMs
+                           │
+                           ▼
+                 ADOM par ADOM
+                           │
+              ┌────────────┴────────────┐
+              ▼                         ▼
+        récupérer packages       détecter absences
+              │                         │
+              ▼                         ▼
+        package par package     missing_count
+              │
+              ▼
+        GET policies complet
+              │
+              ▼
+           validation
+              │
+       ┌──────┴───────┐
+       │              │
+     SUCCESS         FAILED
+       │              │
+       ▼              ▼
+   package OK    enregistrer erreur
+       │
+       ▼
+ tous packages terminés
+       │
+ ┌─────┴──────┐
+ │            │
+tous OK    ≥1 failed
+ │            │
+ ▼            ▼
+nouveau     ancien JSON
+JSON DB      conservé
+ │
+ ▼
+data_version
+ │
+ ▼
+ADOM suivant
+ │
+ ▼
+tous FMG terminés
+ │
+ ▼
+mail données préparées
+ │
+ ▼
+SyncRun READY_FOR_CACHE
+ │
+ ▼
+refresh_rules_cache
+ │
+ ▼
+MySQL → Redis NEW
+ │
+ ▼
+validation NEW
+ │
+ ▼
+switch current
+ │
+ ▼
+UNLINK OLD
+ │
+ ▼
+cache_version
+ │
+ ▼
+SyncRun final
+ │
+ ▼
+MAIL FINAL
+```
+
+Et parallèlement :
+
+```text
+reconcile_rules_cache
+        │
+        ▼
+DB versions ↔ Redis current
+        │
+        ├── identique → rien
+        │
+        ├── absent → rebuild
+        │
+        └── ancien → rebuild
+```
+
+et :
+
+```text
+cleanup_daily_rules
+        │
+        ├── FMG NULL
+        ├── ADOM inactive
+        ├── soft-delete expiré
+        └── Redis NEW abandonné
+                │
+                ▼
+       nettoyage uniquement
+       daily-policy-sync:*
+```
+
+---
+
+## 114. Les deux seules familles de locks
+
+Finalement :
+
+```text
+1. lock extraction
+lock:daily-policy-sync:extraction:fmg:{uid}
+```
+
+utilisé uniquement par notre extraction.
+
+Et :
+
+```text
+2. lock cache
+lock:daily-policy-sync:cache:fmg:{uid}:adom:{name}
+```
+
+utilisé par :
+
+```text
+refresh_rules_cache
+reconcile_rules_cache
+```
+
+Pas besoin d’un lock différent pour chacune des quatre tâches.
+
+---
+
+## 115. Principe de sécurité final vis-à-vis du legacy
+
+On peut résumer toute la stratégie par :
+
+```text
+Nouvelle fonctionnalité
+       │
+       ├── nouveaux modèles
+       ├── nouvelles tâches
+       ├── nouveaux locks
+       ├── nouveau namespace Redis
+       ├── nouveaux timeouts
+       ├── nouveaux retries
+       └── éventuellement nouveau client FMG
+```
+
+et :
+
+```text
+Legacy
+       │
+       └── INCHANGÉ
+```
+
+C’est cette séparation qui doit guider toute l’implémentation.
+
+Le plan final contient donc **4 tâches Celery, 2 familles de locks, un stockage MySQL par ADOM en `JSONField`, un cache Redis versionné et entièrement reconstructible, un nettoyage tolérant aux suppressions de FortiManager via `SET_NULL`, et aucun mécanisme global susceptible de modifier le comportement historique du projet.**
