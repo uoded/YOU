@@ -1,0 +1,48 @@
+Oui. Pour passer à l’implémentation, ce sont bien trois paramètres opérationnels à fixer. Je te recommande des valeurs simples et cohérentes avec l’architecture retenue :
+
+* **Fréquence du réconciler : toutes les 10 minutes.** C’est assez fréquent pour réparer rapidement un cache Redis manquant ou obsolète, sans relire inutilement la base trop souvent. Comme le reconciler commence par comparer uniquement les métadonnées/version et ne charge le gros `JSONField` qu’en cas d’écart, 10 minutes est un bon compromis. Je partirais sur `RECONCILE_INTERVAL = 10 minutes`.
+
+* **Horaire du cleanup : 03:00 chaque jour.** Le cleanup est une tâche de maintenance, donc il vaut mieux la placer loin de l’extraction quotidienne de 14:02 et de sa phase de promotion Redis. À 03:00, elle a peu de chances de concurrencer le flux principal. Si vous avez déjà des sauvegardes ou batchs nocturnes vers 03:00, décale-la vers 04:00 ou 05:00.
+
+* **Durée de rétention des ADOMs soft-deleted : 7 jours.** Avec `ADOM_MISSING_THRESHOLD = 2`, l’ADOM n’est déjà déclaré inactif qu’après deux constats consécutifs d’absence. Ensuite, garder encore 7 jours avant suppression physique donne une marge suffisante pour une réapparition, une erreur de configuration ou une suppression temporaire. Je recommande donc `ADOM_SOFT_DELETE_RETENTION_DAYS = 7`.
+
+La configuration de départ serait donc :
+
+```python
+DAILY_POLICY_RECONCILE_INTERVAL_MINUTES = 10
+
+DAILY_POLICY_CLEANUP_HOUR = 3
+DAILY_POLICY_CLEANUP_MINUTE = 0
+
+ADOM_MISSING_THRESHOLD = 2
+ADOM_SOFT_DELETE_RETENTION_DAYS = 7
+```
+
+Avec le planning global :
+
+```text
+03:00
+cleanup_daily_rules
+        ↓
+nettoyage des orphelins / anciennes versions
+
+toutes les 10 minutes
+reconcile_rules_cache
+        ↓
+vérification MySQL ↔ Redis
+
+14:02
+extract_daily_rules
+        ↓
+FortiManager → MySQL
+        ↓
+fin globale extraction
+        ↓
+refresh_rules_cache
+        ↓
+MySQL → Redis
+```
+
+Un point important : **je n’arrêterais pas le reconciler pendant le cleanup ou pendant l’extraction via un verrou global**. Les tâches restent indépendantes. Elles doivent être conçues de façon idempotente et prudente sur les ressources qu’elles manipulent. En revanche, le `refresh_rules_cache` déclenché après l’extraction reste le mécanisme principal de promotion ; le reconciler n’est qu’un filet de sécurité périodique.
+
+Pour une première mise en production, **10 min / 03:00 / 7 jours** me paraît être une baseline très raisonnable.
