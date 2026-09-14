@@ -1,0 +1,65 @@
+Oui. Sur les deux points, je lui répondrais différemment : **j’accepterais le premier**, mais **je refuserais les queues spécialisées si elles imposent une modification du déploiement existant**.
+
+Tu peux lui transmettre ceci :
+
+Pour le premier point, oui, ajoutons un résultat historique par FortiManager si cela permet de tracer proprement l’exécution de chaque FMG et d’alimenter le bilan global.
+
+Je souhaite donc conserver les niveaux de suivi suivants :
+
+* `SyncRun` : résultat global de l’exécution quotidienne ;
+* un résultat historique par FortiManager : état du FMG pendant ce run (`SUCCESS`, `FAILED`, `SKIPPED_LOCKED`, etc.), durée, nombre d’ADOMs, erreurs/retries éventuels et informations utiles au mail global ;
+* `AdomSyncResult` : résultat détaillé par ADOM.
+
+Le résultat FMG doit notamment permettre de distinguer clairement un FMG réellement traité avec succès, un FMG ayant échoué et un FMG non traité parce que le lock `daily-policy-sync:extraction:fmg:{uid}` de cette nouvelle fonctionnalité était déjà présent.
+
+Concernant les queues/workers Celery, je ne souhaite finalement créer **aucune queue spécialisée si cela nécessite de modifier le déploiement existant**, et je ne souhaite pas non plus créer de worker supplémentaire.
+
+Les 4 nouvelles tâches :
+
+`extract_daily_rules`
+`refresh_rules_cache`
+`reconcile_rules_cache`
+`cleanup_daily_rules`
+
+doivent utiliser l’infrastructure Celery et les workers actuellement existants, exactement comme ils sont déployés aujourd’hui.
+
+Contraintes impératives :
+
+* aucune modification du code des tâches legacy ;
+* aucune modification de leur routing Celery ;
+* aucune modification des queues actuellement écoutées par les workers ;
+* aucune modification des commandes/configurations de démarrage des workers ;
+* aucun worker supplémentaire ;
+* aucune modification du déploiement existant.
+
+Les nouvelles tâches doivent donc être routées vers une queue **déjà consommée par les workers existants** — si la queue actuellement utilisée est `PP`, utilisons `PP` — afin qu'elles puissent fonctionner sans modification du déploiement.
+
+L’isolation vis-à-vis du legacy doit être obtenue au niveau applicatif et non par de nouvelles queues : nouveau code/service/client FortiManager, nouveaux modèles, namespace Redis `daily-policy-sync:*`, timeouts/retries propres à cette fonctionnalité et lock d’extraction propre à un FMG précis.
+
+Le seul lock applicatif ajouté reste :
+
+`lock:daily-policy-sync:extraction:fmg:{uid}`
+
+Il empêche uniquement deux instances de **cette nouvelle extraction** de traiter simultanément le même FortiManager. Il ne verrouille ni le worker, ni Celery, ni Redis globalement, ni MySQL globalement, ni le FortiManager lui-même et n'est pas utilisé par les tâches legacy.
+
+Il faut également veiller à ce que les nouvelles tâches ne monopolisent pas les workers existants : pas de parallélisation massive ni de fan-out incontrôlé. Le traitement d'un FMG reste séquentiel ADOM par ADOM, et les quatre tâches doivent rester compatibles avec les ressources actuellement disponibles.
+
+En résumé : **oui au résultat historique supplémentaire par FMG ; non aux nouvelles queues/workers si elles nécessitent une modification du déploiement. Nous réutilisons l'infrastructure Celery existante sans toucher au legacy ni au déploiement.**
+
+Je ferais toutefois préciser par le développeur **le niveau de concurrence actuel des workers `PP` et le nombre de workers/processus disponibles**, car c'est désormais le principal point à surveiller.
+
+En effet, avec environ **64 minutes d'extraction pour 80 ADOMs d'un FMG**, si `extract_daily_rules` occupe un processus Celery pendant toute cette durée, elle ne modifie pas le legacy, mais elle **consomme tout de même une capacité du pool existant**. Ce n'est pas une régression fonctionnelle du code legacy, mais cela peut devenir une régression de performance si le pool est petit.
+
+Donc notre principe devient :
+
+```text
+Isolation logique forte
+        +
+Infrastructure Celery existante
+        +
+Pas de changement de déploiement
+        +
+Concurrence nouvelle fonctionnalité maîtrisée
+```
+
+Et je retirerais désormais du plan les anciennes recommandations `fmg_extraction`, `cache`, `maintenance`, `notifications` comme queues dédiées : elles étaient intéressantes architecturalement, mais **elles ne correspondent plus à ta contrainte de zéro changement du déploiement**.
